@@ -25,7 +25,7 @@ def _order_quad_points(pts: np.ndarray) -> np.ndarray:
 
 
 def process_init_mode(frame: np.ndarray):
-    """INIT 模式图像处理桩函数。
+    """INIT 模式图像处理。
 
     返回：
     - annotated_frame: 画了边框和角点标注的图像
@@ -33,22 +33,22 @@ def process_init_mode(frame: np.ndarray):
     """
     annotated = frame.copy()
 
-    # 1) 预处理：灰度 + 高斯滤波，降低噪声干扰
+    # 1) 预处理：灰度与中值滤波。
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     blur = cv2.medianBlur(gray, 5)
 
-    # 2) 边缘检测：Canny 提取主要边缘
+    # 2) Canny 边缘检测。
     edges = cv2.Canny(blur, 40, 150)
 
     kernel = np.ones((5, 5), np.uint8)
     edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
 
-    # 3) 轮廓提取：保留所有层级，便于识别内外两层胶带。
+    # 3) 轮廓提取。
     contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
 
     quads: list[QuadInfo] = []
 
-    # 4) 候选四边形筛选：面积阈值 + 多边形拟合，并记录面积与质心。
+    # 4) 四边形筛选：按面积和拟合边数过滤。
     for cnt in contours:
         area = cv2.contourArea(cnt)
         if area <= 1000:
@@ -74,7 +74,7 @@ def process_init_mode(frame: np.ndarray):
     corners = []
     best_ordered: Optional[np.ndarray] = None
 
-    # 核心归一化：在前 5 个候选四边形中做双重循环，寻找稳定的内外双层配对。
+    # 在前 5 个候选四边形中寻找内外配对。
     if len(quads) >= 2:
         search_quads = quads[:5]
         matched_pair = False
@@ -100,7 +100,7 @@ def process_init_mode(frame: np.ndarray):
 
                     best_ordered = (p_outer + p_inner) / 2.0
 
-                    # 蓝色绘制两层原始框，绿色粗线绘制平均骨架框。
+                    # 蓝色绘制双层框，绿色绘制平均框。
                     cv2.drawContours(annotated, [p_outer.astype(np.int32)], -1, (255, 0, 0), 2)
                     cv2.drawContours(annotated, [p_inner.astype(np.int32)], -1, (255, 0, 0), 2)
                     cv2.drawContours(annotated, [best_ordered.astype(np.int32)], -1, (0, 255, 0), 5)
@@ -111,7 +111,7 @@ def process_init_mode(frame: np.ndarray):
             if matched_pair:
                 break
 
-    # 未形成双层时，降级使用面积最大的一层。
+    # 未匹配双层时，退化为单层最大四边形。
     if best_ordered is None and len(quads) >= 1:
         best_ordered = _order_quad_points(np.asarray(quads[0]["pts"], dtype=np.float32))
         cv2.drawContours(annotated, [best_ordered.astype(np.int32)], -1, (0, 255, 0), 3)
@@ -132,7 +132,7 @@ def process_init_mode(frame: np.ndarray):
                 2,
             )
 
-    # 左上角叠加缩小版边缘图，辅助调参。
+    # 可开启边缘图叠加以辅助阈值调试。
     # edges_bgr = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
     # edges_small = cv2.resize(edges_bgr, (160, 120))
     # annotated[0:120, 0:160] = edges_small
@@ -141,8 +141,7 @@ def process_init_mode(frame: np.ndarray):
 
 def process(frame: np.ndarray) -> np.ndarray:
     """
-    状态机：阶段一（建图模式）
-    核心任务：寻找电工胶带围成的四边形，并提取四个顶点
+    兼容接口：INIT 模式处理入口。
     """
     annotated, _ = process_init_mode(frame)
     return annotated
@@ -166,7 +165,8 @@ def process_tracking_mode(
     """
     annotated = frame.copy()
 
-    # 若给定目标点，先做逆透视映射，绘制原图像素系中的“诱饵”大圆。
+    # 若存在目标点，先逆透视到原图并绘制目标圈。
+    expected_uv: Optional[tuple[float, float]] = None
     if current_target is not None:
         try:
             M_inv = np.linalg.inv(M)
@@ -174,48 +174,110 @@ def process_tracking_mode(
             target_uv = cv2.perspectiveTransform(target_pt, M_inv)
             tu = int(round(float(target_uv[0, 0, 0])))
             tv = int(round(float(target_uv[0, 0, 1])))
+            expected_uv = (float(target_uv[0, 0, 0]), float(target_uv[0, 0, 1]))
             cv2.circle(annotated, (tu, tv), 15, (0, 255, 255), 3)
         except np.linalg.LinAlgError:
-            # M 不可逆时跳过诱饵绘制，避免中断追踪主流程。
+            # 矩阵不可逆时跳过绘制，不中断主流程。
             pass
 
-    # 1) LAB 空间提取红激光：结合发白中心与红色光晕两类响应。
+    # 1) 在 LAB + HSV + 红色优势空间提取激光候选区域。
     lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
     l_ch, a_ch, b_ch = cv2.split(lab)
-    _ = b_ch  # 保留拆分完整性，便于后续按需扩展阈值策略。
+    _ = b_ch  # 预留后续阈值策略扩展。
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    h_ch, s_ch, v_ch = cv2.split(hsv)
 
-    center_mask = (l_ch > 180) & (a_ch > 130)
-    halo_mask = (l_ch > 60) & (a_ch > 135)
-    mask = center_mask | halo_mask
+    # 在黑胶带区域放宽亮度约束，强调“红色性”而不是“绝对亮度”。
+    l_p85 = int(np.percentile(l_ch, 85))
+    a_p80 = int(np.percentile(a_ch, 80))
+    l_thresh = max(20, l_p85 - 10)
+    a_thresh = max(128, a_p80)
+
+    center_mask = (l_ch > l_thresh) & (a_ch > a_thresh)
+
+    bgr = frame.astype(np.int16)
+    red_dom = bgr[:, :, 2] - np.maximum(bgr[:, :, 1], bgr[:, :, 0])
+    red_dom_mask = (red_dom > 10) & (a_ch > 120)
+
+    hsv_red_mask = (
+        ((h_ch < 15) | (h_ch > 165))
+        & (s_ch > 55)
+        & (v_ch > 18)
+    )
+
+    # center_mask 保证亮点，red_dom/hsv_red 补偿暗背景小红点。
+    mask = center_mask | red_dom_mask | hsv_red_mask
     mask_u8 = (mask.astype(np.uint8)) * 255
 
-    # 先闭后开：修复光斑内部断裂，再去除小孤立噪声。
-    kernel = np.ones((5, 5), dtype=np.uint8)
+    # 轻量形态学，尽量保留小光斑。
+    kernel = np.ones((2, 2), dtype=np.uint8)
     mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, kernel)
     mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_OPEN, kernel)
 
-    # 2) 在掩膜中提取最大连通域（轮廓）并计算质心。
+    # 若已有期望目标，优先在目标附近检索，提升黑色背景下鲁棒性。
+    if expected_uv is not None:
+        roi = np.zeros_like(mask_u8)
+        ex_u = int(round(expected_uv[0]))
+        ex_v = int(round(expected_uv[1]))
+        cv2.circle(roi, (ex_u, ex_v), 90, 255, -1)
+        roi_mask_u8 = cv2.bitwise_and(mask_u8, roi)
+        if cv2.countNonZero(roi_mask_u8) > 0:
+            mask_u8 = roi_mask_u8
+
+    h, w = annotated.shape[:2]
+    
+    a_bgr = cv2.cvtColor(a_ch, cv2.COLOR_GRAY2BGR)
+    a_small = cv2.resize(a_bgr, (160, 120))
+    mask_bgr = cv2.cvtColor(mask_u8, cv2.COLOR_GRAY2BGR)
+    mask_small = cv2.resize(mask_bgr, (160, 120))
+    
+    annotated[h-120:h, 0:160] = a_small
+    annotated[h-120:h, w-160:w] = mask_small
+    
+    cv2.putText(annotated, "Debug: A-Channel", (5, h-5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+    cv2.putText(annotated, "Debug: Final Mask", (w-155, h-5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+    cv2.putText(
+        annotated,
+        f"L>{l_thresh} A>{a_thresh} Rdom>10",
+        (5, 18),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.5,
+        (0, 255, 255),
+        1,
+    )
+
+    # 2) 提取轮廓并计算激光质心。
     contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         return annotated, None
 
-    # ====== 带通滤波器 ======
+    # 面积过滤：放宽下限以接纳黑底上的极小光斑。
     valid_contours = []
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        # 过滤掉极小的幽灵噪点 (Area < 5) 
-        # 过滤掉巨大的红衣服、红瓶盖 (Area > 300)
-        # 这个范围你可以根据实际激光点大小微调
-        if 5.0 <= area <= 300.0:
+        if 2.0 <= area <= 2500.0:
             valid_contours.append(cnt)
 
-    # 如果过滤完之后，一个合格的轮廓都没了，说明激光确实不在画面里
+    # 无合格轮廓时返回未检测。
     if not valid_contours:
         return annotated, None
 
-    # 在“合格”的轮廓里，挑一个最大的（应对激光晕开的情况）
-    largest = max(valid_contours, key=cv2.contourArea)
-    # ============================================
+    # 在合格轮廓中按“目标邻近 + 面积”综合打分。
+    def _score_contour(cnt: np.ndarray) -> float:
+        area = float(cv2.contourArea(cnt))
+        if expected_uv is None:
+            return area
+
+        m2 = cv2.moments(cnt)
+        if m2["m00"] == 0:
+            return -1.0
+
+        cu = float(m2["m10"] / m2["m00"])
+        cv = float(m2["m01"] / m2["m00"])
+        dist = math.hypot(cu - expected_uv[0], cv - expected_uv[1])
+        return area - 0.35 * dist
+
+    largest = max(valid_contours, key=_score_contour)
 
     m = cv2.moments(largest)
     if m["m00"] == 0:
@@ -224,13 +286,13 @@ def process_tracking_mode(
     u = float(m["m10"] / m["m00"])
     v = float(m["m01"] / m["m00"])
 
-    # 3) 透视跃迁：将像素点 (u, v) 映射到完美画布坐标 (X, Y)。
+    # 3) 透视映射：将像素坐标映射到画布坐标。
     src_pt = np.array([[[u, v]]], dtype=np.float32)
     dst_pt = cv2.perspectiveTransform(src_pt, M)
     X = float(dst_pt[0, 0, 0])
     Y = float(dst_pt[0, 0, 1])
 
-    # 可视化：十字准星 + 像素坐标与映射坐标。
+    # 可视化：十字准星和坐标文本。
     ui, vi = int(round(u)), int(round(v))
     cross_len = 12
     cv2.line(annotated, (ui - cross_len, vi), (ui + cross_len, vi), (0, 255, 0), 2)

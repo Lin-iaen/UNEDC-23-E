@@ -1,9 +1,9 @@
-"""轨迹规划模块（Trajectory Planner）。
+"""轨迹规划模块。
 
-本模块负责：
-1. 将矩形边界离散为细粒度目标点序列（插补轨迹）；
-2. 通过统一步长降低“狗骨头效应”带来的拐角误差；
-3. 向主控制循环提供稳定、可迭代的目标点输出接口。
+职责：
+1. 将矩形边界离散为目标点序列。
+2. 以固定步长提供可迭代轨迹。
+3. 向主状态机输出目标点。
 """
 
 from __future__ import annotations
@@ -24,9 +24,9 @@ def _interpolate_segment(start: Point, end: Point, step_size: float) -> List[Poi
 	"""对线段进行等距插补，返回包含起点和终点的点序列。
 
 	说明：
-	- 使用欧氏距离计算该线段需要的采样数；
-	- 采用线性插值生成中间点，保证相邻点间距接近 step_size；
-	- 若线段长度不足 step_size，也至少返回 [start, end]。
+	- 使用欧氏距离计算采样数量。
+	- 使用线性插值生成中间点。
+	- 线段长度不足 step_size 时仍返回起止点。
 	"""
 	x0, y0 = start
 	x1, y1 = end
@@ -37,7 +37,7 @@ def _interpolate_segment(start: Point, end: Point, step_size: float) -> List[Poi
 	if length == 0:
 		return [start]
 
-	# 至少切分为 1 段，避免除零；向上取整保证步长不超过 step_size。
+	# 至少切分为 1 段，避免除零。
 	steps = max(1, math.ceil(length / step_size))
 	points: List[Point] = []
 
@@ -59,7 +59,7 @@ def generate_rect_path(width: float, height: float, step_size: float) -> List[Po
 	返回：
 	- 按顺时针方向排列的闭环点序列，起点为 (0, 0)
 
-	轨迹顺序：
+	路径顺序：
 	(0,0) -> (width,0) -> (width,height) -> (0,height) -> (0,0)
 	"""
 	if width <= 0:
@@ -82,7 +82,7 @@ def generate_rect_path(width: float, height: float, step_size: float) -> List[Po
 		segment = _interpolate_segment(corners[idx], corners[idx + 1], step_size)
 
 		if idx > 0 and segment:
-			# 后续线段首点与前一线段终点重复，跳过以避免重复目标点。
+			# 去除与上一段重复的连接点。
 			segment = segment[1:]
 
 		path.extend(segment)
@@ -118,7 +118,7 @@ class TrajectoryController:
 
 	@property
 	def path(self) -> List[Point]:
-		"""返回轨迹点副本，避免外部意外篡改内部状态。"""
+		"""返回轨迹点副本，避免外部修改内部状态。"""
 		return list(self._path)
 
 	@property
@@ -137,8 +137,8 @@ class TrajectoryController:
 		"""获取下一个目标点。
 
 		返回：
-		- 非循环模式 loop=False：轨迹结束后返回 None；
-		- 循环模式 loop=True：轨迹结束后从头开始。
+		- loop=False: 轨迹结束后返回 None。
+		- loop=True: 轨迹结束后回到起点。
 		"""
 		if not self._path:
 			logger.warning("轨迹为空，无法提供目标点")
@@ -165,21 +165,19 @@ class TrajectoryController:
 
 	def check_and_fast_forward(self, laser_x: float, laser_y: float, tolerance: float, lookahead_window: int = 15) -> bool:
 		"""
-		前瞻窗口机制：检查激光是否已经走在了轨迹前面。
-		如果在前方 lookahead_window 个点内找到了满足容差的点，直接快进到该点。
+		前瞻机制：若激光落在前方窗口内，则快进索引。
 		"""
 		if not self._path:
 			return False
 
-		# 当前正在追踪的点的索引其实是 self._index - 1
-		# 因为 get_next_target 调用后 self._index 已经自增了
+		# 当前追踪点索引为 self._index - 1。
 		current_idx = max(0, self._index - 1)
 		
-		# 防跌落保护
+		# 越界保护。
 		if current_idx >= len(self._path):
 			return False
 
-		# 视野范围：从当前点，一直看到前方 lookahead_window 个点
+		# 检查前瞻窗口范围。
 		end_idx = min(current_idx + lookahead_window + 1, len(self._path))
 		
 		for i in range(current_idx, end_idx):
@@ -187,11 +185,11 @@ class TrajectoryController:
 			dist = math.hypot(tx - laser_x, ty - laser_y)
 			
 			if dist <= tolerance:
-				# 如果吃到了后面的点，触发快进机制
+				# 命中后续点时触发快进。
 				if i > current_idx:
 					logger.debug(f"快进跳跃到点 {i}")
-					# 快进后，下一个该取的点应该是 i + 1
+					# 快进后，下一个输出点为 i + 1。
 					self._index = i + 1  
-				return True  # 满足容差，任务可以继续推演
+				return True  # 已满足容差。
 				
 		return False

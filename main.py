@@ -1,9 +1,9 @@
-"""IBVS 双状态机主干骨架。
+"""IBVS 主控制模块。
 
-当前版本目标：
-1. 搭建高可读、可扩展的主状态机框架；
-2. 与轨迹模块解耦，只保留核心流程骨架；
-3. 用详细日志记录状态迁移与关键步骤，便于后续联调。
+职责：
+1. 管理系统状态机。
+2. 协调相机、视觉、串口和 Web 控制。
+3. 维护运行期共享数据。
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ from trajectory import TrajectoryController
 from uart_comm import UartController
 from web_stream import WebStreamServer
 
-# 导包结束，以下为主控制器实现。
+# 以下为主控制器实现。
 
 logging.basicConfig(
     level=logging.DEBUG,
@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 
 class State(Enum):
     """系统主状态枚举。"""
-    # auto自动分配数值,每个状态互斥，按顺序递增
+    # auto() 自动分配值，状态按声明顺序递增。
 
     INIT = auto()
     ALIGN = auto()
@@ -91,26 +91,26 @@ class IBVSController:
         canvas_height: int = 480,
         step_size: float = 8.0,
     ) -> None:
-        # 示例参数：后续可从配置文件或命令行读取。
+        # 初始化画布和轨迹参数。
         self.canvas_width = canvas_width
         self.canvas_height = canvas_height
         self.step_size = step_size
 
-        # 状态机核心运行态。
+        # 状态机运行态。
         self.state = State.INIT
-        self.perspective_matrix: Optional[np.ndarray] = None #Optional, 可空类型, 可以是np.ndarray或None
+        self.perspective_matrix: Optional[np.ndarray] = None  # 透视矩阵，未完成标定时为空。
         self.trajectory: Optional[TrajectoryController] = None
         self.current_target: Optional[Tuple[float, float]] = None
         self.cmd_queue: queue.Queue[str] = queue.Queue()
 
-        # INIT 阶段确认与稳定性控制。
+        # INIT 阶段的稳定检测与人工确认控制。
         self.user_confirmed = False
         self.confirm_thread_started = False
         self.stable_frames_required = 12
         self.stable_jitter_threshold_px = 6.0
         self.stable_corner_history: List[List[Tuple[float, float]]] = []
 
-        # 基础资源初始化：相机 + 帧缓冲 + 串口 + Web 图传。
+        # 基础资源：相机、共享帧、串口、Web 服务。
         self.camera = Camera(width=self.canvas_width, height=self.canvas_height, fps=30)
         self.hub = FrameHub()
         self.uart = UartController()
@@ -155,10 +155,15 @@ class IBVSController:
         input("按回车键确认标定完成，系统将进入 HOMING 阶段...")
         self.user_confirmed = True
 
-    def _handle_init(self, frame: np.ndarray) -> None:
-        # logger.info("[INIT] 标定阶段：寻找胶带四角并计算透视矩阵")
+    def _restore_init_camera_profile(self, reason: str) -> None:
+        """回退 INIT 前恢复建图曝光配置，确保画面重新可见。"""
+        logger.warning("[CAMERA] 回退 INIT 前执行复明: %s", reason)
+        self.camera.set_exposure(shutter_us=30000, gain=3.0, awb="auto")
 
-        # tracker.process_init_mode 输出带标注画面与角点列表。
+    def _handle_init(self, frame: np.ndarray) -> None:
+        # INIT: 提取角点，满足稳定条件后计算透视矩阵。
+
+        # 返回标注画面和角点列表。
         annotated_frame, corners = process_init_mode(frame)
 
         if len(corners) == 4:
@@ -167,12 +172,6 @@ class IBVSController:
                 self.stable_corner_history.pop(0)
 
             jitter = _max_corner_jitter(self.stable_corner_history)
-            # logger.debug(
-            #     "[INIT] 已检测到 4 角点: stable_count=%d/%d, jitter=%.3fpx",
-            #     len(self.stable_corner_history),
-            #     self.stable_frames_required,
-            #     jitter,
-            # )
 
             if (
                 len(self.stable_corner_history) >= self.stable_frames_required
@@ -190,7 +189,7 @@ class IBVSController:
                 )
 
                 self.perspective_matrix = cv2.getPerspectiveTransform(src, dst)
-                # logger.info("[INIT] 透视矩阵计算成功:\n%s", self.perspective_matrix)
+                # 可在此输出矩阵用于标定排查。
 
                 cv2.putText(
                     annotated_frame,
@@ -212,6 +211,12 @@ class IBVSController:
                     logger.info("[INIT] 已启动终端回车确认线程，等待用户确认")
 
                 if self.user_confirmed:
+                    self.camera.set_exposure(
+                        shutter_us=9000,
+                        gain=3.0,
+                        awb="manual",
+                    )
+                    time.sleep(0.5)
                     self.state = State.HOMING
                     logger.info("状态迁移: INIT -> HOMING（用户已确认）")
         else:
@@ -227,9 +232,10 @@ class IBVSController:
         logger.info("状态迁移: ALIGN -> HOMING")
 
     def _handle_homing(self, frame: np.ndarray) -> None:
-        # logger.debug("[HOMING] 执行归中复位")
+        # HOMING: 将激光拉回画布中心。
 
         if self.perspective_matrix is None:
+            self._restore_init_camera_profile("[HOMING] perspective_matrix 丢失")
             logger.error("[HOMING] perspective_matrix 为空，回退到 INIT")
             self.state = State.INIT
             return
@@ -243,7 +249,7 @@ class IBVSController:
         self.hub.set(annotated_frame)
 
         if mapped_xy is None:
-            # logger.warning("[HOMING] 未检测到激光点，等待中...")
+            # 未检测到激光点时保持等待。
             return
 
         laser_x, laser_y = mapped_xy
@@ -252,17 +258,10 @@ class IBVSController:
         self.uart.send_error(dx, dy)
 
         error_dist = math.hypot(dx, dy)
-        # logger.debug(
-        #     "[HOMING] 激光=(%.2f, %.2f), 误差(dx=%.2f, dy=%.2f), dist=%.2f",
-        #     laser_x,
-        #     laser_y,
-        #     dx,
-        #     dy,
-        #     error_dist,
-        # )
+        # 可在此输出归中误差用于调参。
 
         if error_dist < 8.0:
-            logger.info("已成功复位到中心！")
+            logger.info("已成功复位到中心")
             logger.info("复位完成，进入待机")
             self.state = State.IDLE
             logger.info("状态迁移: HOMING -> IDLE")
@@ -270,6 +269,7 @@ class IBVSController:
     def _handle_idle(self, frame: np.ndarray) -> None:
         """待机状态：仅显示中心诱饵，不发送 UART 控制。"""
         if self.perspective_matrix is None:
+            self._restore_init_camera_profile("[IDLE] perspective_matrix 丢失")
             logger.error("[IDLE] perspective_matrix 为空，回退到 INIT")
             self.state = State.INIT
             return
@@ -283,14 +283,16 @@ class IBVSController:
         self.hub.set(annotated_frame)
 
     def _handle_tracking(self, frame: np.ndarray) -> None:
-        # logger.debug("[TRACKING] 执行轨迹跟踪")
+        # TRACKING: 计算误差并发送闭环控制量。
 
         if self.trajectory is None:
+            self._restore_init_camera_profile("[TRACKING] trajectory 丢失")
             logger.error("[TRACKING] trajectory 丢失，回退到 INIT")
             self.state = State.INIT
             return
 
         if self.perspective_matrix is None:
+            self._restore_init_camera_profile("[TRACKING] perspective_matrix 丢失")
             logger.error("[TRACKING] perspective_matrix 为空，回退到 INIT")
             self.state = State.INIT
             return
@@ -305,13 +307,7 @@ class IBVSController:
             logger.info("状态迁移: TRACKING -> FINISH")
             return
 
-        # logger.debug(
-        #     "[TRACKING] 当前目标点=(%.2f, %.2f), index=%d/%d",
-        #     self.current_target[0],
-        #     self.current_target[1],
-        #     self.trajectory.current_index,
-        #     self.trajectory.total_points,
-        # )
+        # 可在此输出当前目标点和轨迹索引。
 
         annotated_frame, mapped_xy = process_tracking_mode(
             frame,
@@ -329,31 +325,11 @@ class IBVSController:
         dy = self.current_target[1] - laser_y
         self.uart.send_error(dx, dy)
 
-        # error_dist = math.hypot(dx, dy)
-        # tolerance = 15.0
-        # reached = error_dist <= tolerance
-        # logger.debug(
-        #     "[TRACKING] 激光=(%.2f, %.2f), 误差(dx=%.2f, dy=%.2f), dist=%.2f, tol=%.2f, reached=%s",
-        #     laser_x,
-        #     laser_y,
-        #     dx,
-        #     dy,
-        #     error_dist,
-        #     tolerance,
-        #     reached,
-        # )
-
         tolerance = 15.0
         reached = self.trajectory.check_and_fast_forward(laser_x, laser_y, tolerance, lookahead_window=15)
 
-
-        # logger.debug(
-        #     "[TRACKING] 激光=(%.2f, %.2f), 目标=(%.2f, %.2f), 误差(dx=%.2f, dy=%.2f), reached=%s",
-        #     laser_x, laser_y, self.current_target[0], self.current_target[1], dx, dy, reached
-        # )
-
         if reached:
-            # logger.debug("[TRACKING] 目标已到达或已快进越过，获取最新的下一个插补点")
+            # 到达或快进后更新下一个目标点。
             self.current_target = self.trajectory.get_next_target()
             if self.current_target is None:
                 logger.info("[TRACKING] 无后续目标点，进入 FINISH")
@@ -363,9 +339,9 @@ class IBVSController:
     def _handle_finish(self) -> None:
         logger.info("[FINISH] 任务结束，进行收尾处理")
 
-        # TODO: 发送串口（停机/复位指令）
-        # TODO: 保存日志与运行统计数据
-        logger.info("任务完成！1秒后系统回到 IDLE，等待下一次命令...")
+        # TODO: 发送停机或复位指令。
+        # TODO: 保存运行统计信息。
+        logger.info("任务完成，1秒后系统回到 IDLE，等待下一次命令")
         time.sleep(1)
 
         self.current_target = None
@@ -384,7 +360,7 @@ class IBVSController:
             name="web-stream-thread",
         )
         self.web_thread.start()
-        logger.info("Web调试已在后台线程启动")
+        # Web 服务后台线程已启动。
 
     def run(self) -> None:
         """主控制循环：获取最新帧并按状态分发处理。"""
@@ -393,7 +369,7 @@ class IBVSController:
 
         try:
             while True:
-                # logger.debug("主循环 tick，当前状态=%s", self.state.name)
+                # 主循环：优先处理命令，再处理图像。
 
                 while not self.cmd_queue.empty():
                     try:
@@ -402,20 +378,20 @@ class IBVSController:
                         break
                     self._process_command(cmd)
 
-                # 不断获取最新帧
+                # 获取最新图像帧。
                 frame = self.camera.get_latest_frame()
                 if frame is None:
                     if self.state == State.INIT:
-                        # logger.debug("[INIT] 暂未拿到图像帧，等待中")
+                        # INIT 等待图像。
                         pass
                     elif self.state == State.HOMING:
-                        # logger.debug("[HOMING] 暂未拿到图像帧，等待中")
+                        # HOMING 等待图像。
                         pass
                     elif self.state == State.TRACKING:
-                        # logger.debug("[TRACKING] 暂未拿到图像帧，等待中")
+                        # TRACKING 等待图像。
                         pass
                     elif self.state == State.IDLE:
-                        # logger.debug("[IDLE] 暂未拿到图像帧，等待中")
+                        # IDLE 等待图像。
                         pass
                     time.sleep(0.02)
                     continue
@@ -434,9 +410,10 @@ class IBVSController:
                     self._handle_finish()
                 else:
                     logger.error("检测到未知状态=%s，强制回到 INIT", self.state)
+                    self._restore_init_camera_profile("未知状态保护回退")
                     self.state = State.INIT
 
-                # 防止空转占满 CPU；后续可改为与帧率同步。
+                # 降低空转占用，后续可按帧率同步。
                 time.sleep(0.01)
         finally:
             logger.info("正在关闭 Camera 资源")

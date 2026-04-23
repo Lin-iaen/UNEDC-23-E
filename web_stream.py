@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 
 
 class WebStreamServer:
-	"""仅负责 Flask 服务与 MJPEG 推流，不包含硬件采集逻辑。"""
+	"""Flask + MJPEG 推流服务，不包含硬件采集。"""
 
 	def __init__(
 		self,
