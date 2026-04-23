@@ -213,8 +213,8 @@ class IBVSController:
                 if self.user_confirmed:
                     self.camera.set_exposure(
                         shutter_us=30000,
-                        gain=1.5,
-                        awb="manual",
+                        gain=2.5,
+                        awb="auto",
                     )
                     time.sleep(0.5)
                     self.state = State.HOMING

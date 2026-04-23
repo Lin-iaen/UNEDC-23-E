@@ -180,32 +180,20 @@ def process_tracking_mode(
             # 矩阵不可逆时跳过绘制，不中断主流程。
             pass
 
-    # 1) 极简 LAB 提取
-    lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
-    l_ch, a_ch, b_ch = cv2.split(lab)
+    # 1) 转换到 HSV 并分离通道。
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    h_ch, s_ch, v_ch = cv2.split(hsv)
 
-    # ====== 终极双重掩膜：专门对付“过曝白洞” ======
-    
-    # 路线 A：抓取“红晕”和“黑胶带上的弱光斑”
-    # 特征：亮度要求低，但必须明显偏红
-    halo_mask = (l_ch > 25) & (a_ch > 135)
-    
-    # 路线 B：白洞依然用高亮抓取
-    core_mask = (l_ch > 240) & (a_ch >= 126)
+    # 2) 双重掩膜：红晕 + 过曝白洞核心。
+    halo_mask = ((h_ch < 10) | (h_ch > 160)) & (s_ch > 100) & (v_ch > 20)
+    core_mask = (v_ch > 240) & (s_ch < 80)
+    combined_mask = halo_mask | core_mask
+    mask_u8 = combined_mask.astype(np.uint8) * 255
 
-    mask = halo_mask | core_mask
-    mask_u8 = (mask.astype(np.uint8)) * 255
-
-    # ====== 救命的调换：先杀噪点，再填白洞 ======
+    # 3) 形态学：严格先开后闭。
     kernel_open = np.ones((3, 3), dtype=np.uint8)
-    kernel_close = np.ones((7, 7), dtype=np.uint8) 
-
-    # 第一步：开运算 (OPEN) —— 无情抹杀四周暗角的散沙噪点！
-    # 这一步过去后，暗角里的红色雪花点会瞬间灰飞烟灭。
+    kernel_close = np.ones((7, 7), dtype=np.uint8)
     mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_OPEN, kernel_open)
-    
-    # 第二步：闭运算 (CLOSE) —— 填补真正的激光白洞！
-    # 此时画面里只剩下真正的高亮激光（虽然中间是空的），用大核把甜甜圈糊成实心饼。
     mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, kernel_close)
 
     # 若已有期望目标，优先在目标附近检索 (保持你的原代码不变)
@@ -219,18 +207,34 @@ def process_tracking_mode(
             mask_u8 = roi_mask_u8
 
     # --- Debug 投屏层 ---
-    h, w = annotated.shape[:2]
-    
-    a_bgr = cv2.cvtColor(a_ch, cv2.COLOR_GRAY2BGR)
-    a_small = cv2.resize(a_bgr, (160, 120))
+    frame_h, frame_w = annotated.shape[:2]
+
+    v_bgr = cv2.cvtColor(v_ch, cv2.COLOR_GRAY2BGR)
+    v_small = cv2.resize(v_bgr, (160, 120))
     mask_bgr = cv2.cvtColor(mask_u8, cv2.COLOR_GRAY2BGR)
     mask_small = cv2.resize(mask_bgr, (160, 120))
-    
-    annotated[h-120:h, 0:160] = a_small
-    annotated[h-120:h, w-160:w] = mask_small
-    
-    cv2.putText(annotated, "Debug: A-Channel", (5, h-5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
-    cv2.putText(annotated, "Debug: Final Mask", (w-155, h-5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+
+    annotated[frame_h - 120:frame_h, 0:160] = v_small
+    annotated[frame_h - 120:frame_h, frame_w - 160:frame_w] = mask_small
+
+    cv2.putText(
+        annotated,
+        "Debug: V-Channel",
+        (5, frame_h - 5),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.4,
+        (0, 255, 0),
+        1,
+    )
+    cv2.putText(
+        annotated,
+        "Debug: Final HSV Mask",
+        (frame_w - 155, frame_h - 5),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.4,
+        (0, 255, 0),
+        1,
+    )
 
     # 2) 提取轮廓并计算激光质心。
     contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
