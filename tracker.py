@@ -180,41 +180,35 @@ def process_tracking_mode(
             # 矩阵不可逆时跳过绘制，不中断主流程。
             pass
 
-    # 1) 在 LAB + HSV + 红色优势空间提取激光候选区域。
+    # 1) 极简 LAB 提取
     lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
     l_ch, a_ch, b_ch = cv2.split(lab)
-    _ = b_ch  # 预留后续阈值策略扩展。
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    h_ch, s_ch, v_ch = cv2.split(hsv)
 
-    # 在黑胶带区域放宽亮度约束，强调“红色性”而不是“绝对亮度”。
-    l_p85 = int(np.percentile(l_ch, 85))
-    a_p80 = int(np.percentile(a_ch, 80))
-    l_thresh = max(20, l_p85 - 10)
-    a_thresh = max(128, a_p80)
+    # ====== 终极双重掩膜：专门对付“过曝白洞” ======
+    
+    # 路线 A：抓取“红晕”和“黑胶带上的弱光斑”
+    # 特征：亮度要求低，但必须明显偏红
+    halo_mask = (l_ch > 25) & (a_ch > 135)
+    
+    # 路线 B：白洞依然用高亮抓取
+    core_mask = (l_ch > 240) & (a_ch >= 126)
 
-    center_mask = (l_ch > l_thresh) & (a_ch > a_thresh)
-
-    bgr = frame.astype(np.int16)
-    red_dom = bgr[:, :, 2] - np.maximum(bgr[:, :, 1], bgr[:, :, 0])
-    red_dom_mask = (red_dom > 10) & (a_ch > 120)
-
-    hsv_red_mask = (
-        ((h_ch < 15) | (h_ch > 165))
-        & (s_ch > 55)
-        & (v_ch > 18)
-    )
-
-    # center_mask 保证亮点，red_dom/hsv_red 补偿暗背景小红点。
-    mask = center_mask | red_dom_mask | hsv_red_mask
+    mask = halo_mask | core_mask
     mask_u8 = (mask.astype(np.uint8)) * 255
 
-    # 轻量形态学，尽量保留小光斑。
-    kernel = np.ones((2, 2), dtype=np.uint8)
-    mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, kernel)
-    mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_OPEN, kernel)
+    # ====== 救命的调换：先杀噪点，再填白洞 ======
+    kernel_open = np.ones((3, 3), dtype=np.uint8)
+    kernel_close = np.ones((7, 7), dtype=np.uint8) 
 
-    # 若已有期望目标，优先在目标附近检索，提升黑色背景下鲁棒性。
+    # 第一步：开运算 (OPEN) —— 无情抹杀四周暗角的散沙噪点！
+    # 这一步过去后，暗角里的红色雪花点会瞬间灰飞烟灭。
+    mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_OPEN, kernel_open)
+    
+    # 第二步：闭运算 (CLOSE) —— 填补真正的激光白洞！
+    # 此时画面里只剩下真正的高亮激光（虽然中间是空的），用大核把甜甜圈糊成实心饼。
+    mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, kernel_close)
+
+    # 若已有期望目标，优先在目标附近检索 (保持你的原代码不变)
     if expected_uv is not None:
         roi = np.zeros_like(mask_u8)
         ex_u = int(round(expected_uv[0]))
@@ -224,6 +218,7 @@ def process_tracking_mode(
         if cv2.countNonZero(roi_mask_u8) > 0:
             mask_u8 = roi_mask_u8
 
+    # --- Debug 投屏层 ---
     h, w = annotated.shape[:2]
     
     a_bgr = cv2.cvtColor(a_ch, cv2.COLOR_GRAY2BGR)
@@ -236,15 +231,6 @@ def process_tracking_mode(
     
     cv2.putText(annotated, "Debug: A-Channel", (5, h-5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
     cv2.putText(annotated, "Debug: Final Mask", (w-155, h-5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
-    cv2.putText(
-        annotated,
-        f"L>{l_thresh} A>{a_thresh} Rdom>10",
-        (5, 18),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.5,
-        (0, 255, 255),
-        1,
-    )
 
     # 2) 提取轮廓并计算激光质心。
     contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)

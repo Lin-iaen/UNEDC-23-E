@@ -212,8 +212,8 @@ class IBVSController:
 
                 if self.user_confirmed:
                     self.camera.set_exposure(
-                        shutter_us=9000,
-                        gain=3.0,
+                        shutter_us=30000,
+                        gain=1.5,
                         awb="manual",
                     )
                     time.sleep(0.5)
