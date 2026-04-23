@@ -199,9 +199,23 @@ def process_tracking_mode(
     if not contours:
         return annotated, None
 
-    largest = max(contours, key=cv2.contourArea)
-    if cv2.contourArea(largest) <= 0:
+    # ====== 带通滤波器 ======
+    valid_contours = []
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        # 过滤掉极小的幽灵噪点 (Area < 5) 
+        # 过滤掉巨大的红衣服、红瓶盖 (Area > 300)
+        # 这个范围你可以根据实际激光点大小微调
+        if 5.0 <= area <= 300.0:
+            valid_contours.append(cnt)
+
+    # 如果过滤完之后，一个合格的轮廓都没了，说明激光确实不在画面里
+    if not valid_contours:
         return annotated, None
+
+    # 在“合格”的轮廓里，挑一个最大的（应对激光晕开的情况）
+    largest = max(valid_contours, key=cv2.contourArea)
+    # ============================================
 
     m = cv2.moments(largest)
     if m["m00"] == 0:
